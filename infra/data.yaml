@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SIS 3 - data and messaging stack (EventBridge bus, SQS + DLQ, idempotent Lambda consumer, DynamoDB, alarms)
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional e-mail for alarm notifications (leave empty for none)
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: orderId, AttributeType: S}]
+      KeySchema: [{AttributeName: orderId, KeyType: HASH}]
+      Tags: [{Key: Env, Value: !Ref Env}]
+
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-bus'
+
+  OrdersDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600       # 14 days, longer than the source queue
+      SqsManagedSseEnabled: true
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60                 # >= 6 x Lambda timeout (10 s)
+      MessageRetentionPeriod: 345600        # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDlq.Arn
+        maxReceiveCount: 5
+
+  OrderPlacedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-order-placed'
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [kbtu.shop.orders]
+        detail-type: [OrderPlaced]
+      Targets:
+        - Id: orders-queue
+          Arn: !GetAtt OrdersQueue.Arn
+          RetryPolicy: {MaximumRetryAttempts: 185, MaximumEventAgeInSeconds: 86400}
+          DeadLetterConfig: {Arn: !GetAtt OrdersDlq.Arn}
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue, !Ref OrdersDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyThisRule
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt OrdersQueue.Arn, !GetAtt OrdersDlq.Arn]
+            Condition:
+              ArnEquals: {aws:SourceArn: !GetAtt OrderPlacedRule.Arn}
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-consumer'
+      RetentionInDays: 14
+
+  ConsumerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-consumer'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: consumer.handler
+      CodeUri: ../src/consumer/
+      MemorySize: 256
+      Timeout: 10
+      LoggingConfig: {LogGroup: !Ref ConsumerLogGroup}
+      Environment:
+        Variables: {TABLE_NAME: !Ref OrdersTable}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 2}
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-not-empty'
+      AlarmDescription: A message landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt OrdersDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  RuleFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-rule-failed-invocations'
+      AlarmDescription: EventBridge could not deliver an event to the queue
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - {Name: EventBusName, Value: !Ref EventBus}
+        - {Name: RuleName, Value: !Sub '${AWS::StackName}-order-placed'}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  ConsumerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-consumer-errors'
+      AlarmDescription: The consumer function crashed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ConsumerFn}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  TableName:
+    Value: !Ref OrdersTable
+    Export: {Name: !Sub '${AWS::StackName}-TableName'}
+  TableArn:
+    Value: !GetAtt OrdersTable.Arn
+    Export: {Name: !Sub '${AWS::StackName}-TableArn'}
+  BusName:
+    Value: !Ref EventBus
+    Export: {Name: !Sub '${AWS::StackName}-BusName'}
+  BusArn:
+    Value: !GetAtt EventBus.Arn
+    Export: {Name: !Sub '${AWS::StackName}-BusArn'}
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DlqUrl:
+    Value: !Ref OrdersDlq

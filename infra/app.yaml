@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SIS 3 - application stack (ECS Fargate service in private subnets behind an ALB)
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: sis3
+    Description: Prefix of the network, data and ecr stacks to import from
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+  ImageTag:
+    Type: String
+    Description: Image tag to run (set by deploy.sh - never "latest")
+
+Mappings:
+  Sizing:
+    dev:  {Cpu: '256', Memory: '512',  Count: 2}
+    prod: {Cpu: '512', Memory: '1024', Count: 2}
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 14
+
+  # Role 1: used by ECS itself to pull the image and write logs
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+
+  # Role 2: used by the application code inside the container
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: app-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  Fn::ImportValue: !Sub '${Prefix}-data-BusArn'
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::ImportValue: !Sub '${Prefix}-data-TableArn'
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from the internet
+      VpcId:
+        Fn::ImportValue: !Sub '${Prefix}-network-VpcId'
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks - port 8080 only from the ALB
+      VpcId:
+        Fn::ImportValue: !Sub '${Prefix}-network-VpcId'
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup}
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !Split
+        - ','
+        - Fn::ImportValue: !Sub '${Prefix}-network-PublicSubnets'
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId:
+        Fn::ImportValue: !Sub '${Prefix}-network-VpcId'
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-orders-api'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [Sizing, !Ref Env, Cpu]
+      Memory: !FindInMap [Sizing, !Ref Env, Memory]
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Join
+            - ''
+            - - Fn::ImportValue: !Sub '${Prefix}-ecr-RepoUri'
+              - ':'
+              - !Ref ImageTag
+          Essential: true
+          PortMappings: [{ContainerPort: 8080}]
+          Environment:
+            - Name: EVENT_BUS_NAME
+              Value:
+                Fn::ImportValue: !Sub '${Prefix}-data-BusName'
+            - Name: TABLE_NAME
+              Value:
+                Fn::ImportValue: !Sub '${Prefix}-data-TableName'
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref 'AWS::Region'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: api
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !FindInMap [Sizing, !Ref Env, Count]
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          Subnets: !Split
+            - ','
+            - Fn::ImportValue: !Sub '${Prefix}-network-PrivateSubnets'
+      LoadBalancers:
+        - {ContainerName: api, ContainerPort: 8080, TargetGroupArn: !Ref TargetGroup}
+
+Outputs:
+  ServiceUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  ClusterName:
+    Value: !Ref Cluster

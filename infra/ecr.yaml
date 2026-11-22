@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SIS 3 - container registry stack (immutable tags, scan on push, lifecycle policy)
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-orders-api'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Delete untagged images after 1 day",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1},
+             "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep only the last 10 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
+             "action": {"type": "expire"}}
+          ]}
+
+Outputs:
+  RepoName:
+    Value: !Ref Repository
+  RepoUri:
+    Value: !GetAtt Repository.RepositoryUri
+    Export: {Name: !Sub '${AWS::StackName}-RepoUri'}
