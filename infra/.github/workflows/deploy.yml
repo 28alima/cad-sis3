@@ -1,0 +1,64 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  PREFIX: sis3
+  DEPLOY_ROLE_ARN: arn:aws:iam::189053741275:role/sis3-github-deploy   # not a secret
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Lint the templates
+        run: pip install --quiet cfn-lint && cfn-lint infra/*.yaml
+      - name: Check the Python code compiles
+        run: python -m py_compile app/app.py src/consumer/consumer.py
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production   # the OIDC subject becomes ...:environment:production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get temporary AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push the image tagged with the commit SHA
+        run: |
+          REPO=$(aws cloudformation describe-stacks --stack-name $PREFIX-ecr \
+            --query "Stacks[0].Outputs[?OutputKey=='RepoUri'].OutputValue" --output text)
+          aws ecr get-login-password | docker login -u AWS --password-stdin ${REPO%%/*}
+          docker build -t $REPO:$GITHUB_SHA app/
+          docker push $REPO:$GITHUB_SHA
+
+      - name: Deploy the app stack with CloudFormation
+        run: |
+          aws cloudformation deploy --stack-name $PREFIX-app --template-file infra/app.yaml \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+            --parameter-overrides Prefix=$PREFIX Env=dev ImageTag=$GITHUB_SHA
+
+      - name: Smoke test and evidence
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name $PREFIX-app \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" --output text)
+          curl -fsS --retry 5 --retry-delay 5 $URL/health && echo
+          curl -fsS $URL/ && echo
+          aws ecs describe-task-definition --task-definition $PREFIX-app-orders-api \
+            --query "taskDefinition.{revision:revision,image:containerDefinitions[0].image}" --output table
