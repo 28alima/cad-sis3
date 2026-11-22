@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Practice 7 - GitHub Actions OIDC provider and a least-privilege deploy role for the SIS 3 app stack
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: sis3
+  GitHubOwner:
+    Type: String
+    Default: 28alima
+  RepoName:
+    Type: String
+    Default: cad-sis3
+  OwnerId:
+    Type: String
+    Description: Numeric GitHub owner ID (immutable OIDC subject format, repos created after 15 July 2026)
+  RepoId:
+    Type: String
+    Description: Numeric GitHub repository ID
+
+Resources:
+  # One-time per account: trust tokens signed by GitHub Actions, audience sts.amazonaws.com
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                # only the "production" environment of this one repository may assume the role
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOwner}/${RepoName}:environment:production'
+                  - !Sub 'repo:${GitHubOwner}@${OwnerId}/${RepoName}@${RepoId}:environment:production'
+      Policies:
+        - PolicyName: deploy-app-stack-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushToOneRepository
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Prefix}-ecr-*'
+              - Sid: DeployOnlyTheAppStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Prefix}-app/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*'
+              - Sid: ReadStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Prefix}-*/*'
+              - Sid: CloudFormationReads
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListExports
+                Resource: '*'
+              - Sid: EcsRollingUpdate
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DeleteTaskDefinitions
+                  - ecs:UpdateService
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecs:Describe*
+                  - ecs:List*
+                Resource: '*'
+              - Sid: ReadNetworkAndLoadBalancer
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:Describe*
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Sid: ReadAppRoles
+                Effect: Allow
+                Action: iam:GetRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-app-*'
+              - Sid: PassAppRolesToEcsTasksOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-app-*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': ecs-tasks.amazonaws.com
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
